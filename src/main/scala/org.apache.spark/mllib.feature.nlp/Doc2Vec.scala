@@ -21,6 +21,12 @@ import scala.collection.JavaConverters._
 import scala.collection.mutable
 import scala.util.control.Breaks._
 
+private[spark] case class VocabWord(var word: String,
+                                    var cn: Int,
+                                    var point: Array[Int],
+                                    var code: Array[Int],
+                                    var codeLen: Int) extends Serializable
+
 class Doc2Vec() extends Serializable with Logging {
 
   private var vectorSize = 100
