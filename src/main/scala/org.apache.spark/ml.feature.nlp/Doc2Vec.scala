@@ -10,8 +10,21 @@ import org.apache.spark.sql.functions._
 import org.apache.spark.sql.types._
 import org.apache.spark.sql.{DataFrame, Dataset, SparkSession}
 
+
 private[feature] trait Doc2VecBase extends Params
   with HasInputCol with HasOutputCol with HasMaxIter with HasStepSize with HasSeed {
+
+  final val decay = new DoubleParam(
+    this, "decay", "alpha decay",
+    ParamValidators.inRange(0d, 1d, false, true))
+  setDefault(decay -> 1.0d)
+  def getDecay: Double = $(decay)
+
+  final val window = new IntParam(
+    this, "window", "window",
+    ParamValidators.gtEq(0))
+  setDefault(window -> 5)
+  def getWindow: Int = $(window)
 
   final val docIdCol = new Param[String](
     this, "docIdCol", "this id of each document")
@@ -67,11 +80,12 @@ final class Doc2Vec(override val uid: String)
 
   def this() = this(Identifiable.randomUID("doc2vec"))
 
+  def setWindow(value: Int): this.type = set(window, value)
   def setDocIdCol(value: String): this.type = set(docIdCol, value)
   def setCustomDic(value: String): this.type = set(customDic,value)
   def setSample(value: Double): this.type = set(sample, value)
   def setMaxVocabSize(value: Int): this.type = set(maxVocabSize, value)
-
+  def setDecay(value: Double): this.type = set(decay, value)
   def setInputCol(value: String): this.type = set(inputCol, value)
   def setOutputCol(value: String): this.type = set(outputCol, value)
   def setVectorSize(value: Int): this.type = set(vectorSize, value)
@@ -86,7 +100,9 @@ final class Doc2Vec(override val uid: String)
     val input = dataset.select($(docIdCol), $(inputCol)).rdd
       .map(row => (row.getInt(0), row.getAs[Seq[String]](1)))
     val doc2VectorModel = new nlp.Doc2Vec()
+      .setWindow($(window))
       .setSample($(sample))
+      .setDecay($(decay))
       .setCustomDic($(customDic))
       .setLearningRate($(stepSize))
       .setMinCount($(minCount))
@@ -109,7 +125,7 @@ object Doc2Vec extends DefaultParamsReadable[Doc2Vec] {
 }
 
 class Doc2VecModel private[ml](override val uid: String,
-                               @transient private val docModel: nlp.Doc2VecModel)
+                                @transient private val docModel: nlp.Doc2VecModel)
   extends Model[Doc2VecModel] with Doc2VecBase {
 
   @transient lazy val getVectors: DataFrame = {

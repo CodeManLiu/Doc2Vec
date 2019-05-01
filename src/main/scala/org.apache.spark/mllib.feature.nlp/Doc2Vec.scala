@@ -1,21 +1,25 @@
 package org.apache.spark.mllib.feature.nlp
 
+import java.lang.{Iterable => JavaIterable}
+
 import com.github.fommil.netlib.BLAS.{getInstance => blas}
 import org.apache.spark.SparkContext
+import org.apache.spark.api.java.JavaRDD
 import org.apache.spark.broadcast.Broadcast
 import org.apache.spark.internal.Logging
 import org.apache.spark.mllib.linalg.{Vector, Vectors}
+import org.apache.spark.mllib.util.{Loader, Saveable}
 import org.apache.spark.rdd._
-import org.apache.spark.util.Utils
+import org.apache.spark.sql.SparkSession
 import org.apache.spark.util.random.XORShiftRandom
+import org.apache.spark.util.Utils
+import org.json4s.DefaultFormats
+import org.json4s.JsonDSL._
+import org.json4s.jackson.JsonMethods._
 
+import scala.collection.JavaConverters._
 import scala.collection.mutable
-
-private[spark] case class VocabWord(var word: String,
-                                    var cn: Int,
-                                    var point: Array[Int],
-                                    var code: Array[Int],
-                                    var codeLen: Int) extends Serializable
+import scala.util.control.Breaks._
 
 class Doc2Vec() extends Serializable with Logging {
 
@@ -25,14 +29,24 @@ class Doc2Vec() extends Serializable with Logging {
   private var numIterations = 1
   private var seed = Utils.random.nextLong()
   private var minCount = 5
+  private var window = 5
 
-  private var sample = 1e-4
+  private var decay = 1d
+  private var sample = 1e-3
   private var maxVocabSize = 0
   private var customDic = "__customDic__"
 
   private var useCustomDic = false
   private var minReduce = 1
 
+  def setWindow(window: Int): this.type = {
+    this.window = window
+    this
+  }
+  def setDecay(decay: Double): this.type = {
+    this.decay = decay
+    this
+  }
   def setVectorSize(vectorSize: Int): this.type = {
     this.vectorSize = vectorSize
     this
@@ -84,9 +98,11 @@ class Doc2Vec() extends Serializable with Logging {
   private val MAX_EXP = 6
   private val MAX_CODE_LENGTH = 40
 
+
   private var vocab: Array[VocabWord] = null
   private var vocabHash = mutable.HashMap.empty[String, Int]
   private var vocabSize = 0
+  private var trainWordsCount = 0L
 
   private def learnVocab[S <: Iterable[String]](dataset: RDD[S]): Unit = {
     val sc = dataset.sparkContext
@@ -98,8 +114,8 @@ class Doc2Vec() extends Serializable with Logging {
         .collect()
         .sortWith((a, b) => a.cn > b.cn)
     } else {
-      val words = dataset.flatMap(x => x)
-      vocab = words.map(w => (w, 1))
+      vocab = dataset.flatMap(x => x)
+        .map(w => (w, 1))
         .reduceByKey(_ + _)
         .filter(_._2 >= minCount)
         .map(x => VocabWord(x._1, x._2, null, null, 0))
@@ -116,6 +132,7 @@ class Doc2Vec() extends Serializable with Logging {
 
     for (i <- 0 until vocabSize) {
       vocabHash += vocab(i).word -> i
+      trainWordsCount += vocab(i).cn
     }
   }
   private def reduceVocab(): Unit =  {
@@ -234,11 +251,11 @@ class Doc2Vec() extends Serializable with Logging {
   }
 
   private def doFit[S <: Iterable[String]](
-                                            dataset: RDD[(Int, S)],
-                                            sc: SparkContext,
-                                            expTable: Broadcast[Array[Float]],
-                                            bcVocab: Broadcast[Array[VocabWord]],
-                                            bcVocabHash: Broadcast[mutable.HashMap[String, Int]]): Doc2VecModel = {
+    dataset: RDD[(Int, S)],
+    sc: SparkContext,
+    expTable: Broadcast[Array[Float]],
+    bcVocab: Broadcast[Array[VocabWord]],
+    bcVocabHash: Broadcast[mutable.HashMap[String, Int]]): Doc2VecModel = {
 
     val documents: RDD[(Int, Array[Int])] = dataset.mapPartitions { docIter =>
       docIter.map { case(id, doc) =>
@@ -246,61 +263,110 @@ class Doc2Vec() extends Serializable with Logging {
         (id, wordIndexes)
       }
     }.repartition(numPartitions).cache()
+
     val docSize = documents.count().toInt
     val initRandom = new XORShiftRandom(seed)
     //init the vectors
     val syn0Global = Array.fill[Float](docSize * vectorSize)((initRandom.nextFloat() - 0.5f) / vectorSize)
     //init extra vectors
     val syn1Global = new Array[Float](vocabSize * vectorSize)
+    //init the word vectors
+    val syn2Global = new Array[Float](vocabSize * vectorSize)
 
-    val delta = new Array[Float](docSize * vectorSize)
-    Array.copy(syn0Global, 0, delta, 0, docSize * vectorSize)
-    var loss = Float.MaxValue
-    var interation = 0
 
-    var alpha = learningRate
+    var docAlpha = learningRate
+    var wordAlpha = learningRate
+    val totalWordsCounts = numIterations * trainWordsCount + 1
     val startTime = System.currentTimeMillis()
-    while(interation < numIterations && loss > 0.001) {
+
+    for(k <- 1 to numIterations) {
+      docAlpha = decay * docAlpha
       val bcSyn0Global = sc.broadcast(syn0Global)
       val bcSyn1Global = sc.broadcast(syn1Global)
+      val bcSyn2Global = sc.broadcast(syn2Global)
+      val numWordsProcessedInPreviousIterations = (k - 1) * trainWordsCount
 
-      val now = System.currentTimeMillis()
-      val run = (now - startTime + 1).toDouble / 1000
-      logInfo(f"interation = $interation, alpha = $alpha%.5f, time = $run%.2f S")
-
-      val partial = documents.mapPartitions { iter =>
+      val partial = documents.mapPartitionsWithIndex { case (idx, iter) =>
+        val random = new XORShiftRandom(seed ^ ((idx + 1) << 16) ^ ((-k - 1) << 8))
         val syn0Modify = new Array[Int](docSize)
         val syn1Modify = new Array[Int](vocabSize)
+        val syn2Modify = new Array[Int](vocabSize)
         val neu1e = new Array[Float](vectorSize)
 
-        val model = iter.foldLeft((bcSyn0Global.value, bcSyn1Global.value)) {
-          case ((syn0, syn1), (id, doc)) =>
+        val model = iter.foldLeft((bcSyn0Global.value, bcSyn1Global.value, bcSyn2Global.value, 0L, 0L)) {
+          case ((syn0, syn1, syn2,lastWordCount, wordCount), (id, doc)) =>
             require(id < docSize)
+            var lwc = lastWordCount
+            var wc = wordCount
+            if (wordCount - lastWordCount > 10000) {
+              lwc = wordCount
+              val wordCountActual = numPartitions * wordCount.toDouble + numWordsProcessedInPreviousIterations
+              wordAlpha = learningRate * (1 - wordCountActual / totalWordsCounts)
+              if (wordAlpha < learningRate * 0.0001) wordAlpha = learningRate * 0.0001
+              val runTime = (System.currentTimeMillis() - startTime + 1).toDouble / 1000
+              val pro = wordCountActual / totalWordsCounts * 100
+              val progress = if(pro > 100) 100 else pro
+              logInfo(s"wordCount = ${wordCountActual.toInt}, " + f"docAlpha = $docAlpha%.5f, " +
+                f"wordAlpha = $wordAlpha%.5f, " + f"runtime = $runTime%.2f S, " + f"progress = $progress%.2f%%, ")
+            }
+            wc += doc.length
             val docIndex = id * vectorSize
             for (pos <- doc.indices) {
-              val word = doc(pos)
-              blas.sscal(vectorSize, 0f, neu1e,1)
-              for (i <- 0 until bcVocab.value(word).codeLen) {
-                val inner = bcVocab.value(word).point(i)
-                val l2 = inner * vectorSize
-                val f = blas.sdot(vectorSize, syn0, docIndex, 1, syn1, l2, 1)
-                val sig = if (f > MAX_EXP) 1 else if (f < -MAX_EXP) 0 else {
-                  val ind = ((f + MAX_EXP) * (EXP_TABLE_SIZE / MAX_EXP / 2.0)).toInt
-                  expTable.value(ind)
+              breakable {
+                val word = doc(pos)
+                if (sample > 0) {
+                  val ran = (math.sqrt(bcVocab.value(word).cn / (sample * trainWordsCount)) + 1) *
+                    (sample * trainWordsCount) / bcVocab.value(word).cn
+                  if (ran < random.nextDouble()) break()
                 }
-                val g = ((1 - bcVocab.value(word).code(i) - sig) * alpha).toFloat
-                blas.saxpy(vectorSize, g, syn1, l2, 1, neu1e, 0, 1)
-                blas.saxpy(vectorSize, g, syn0, docIndex, 1, syn1, l2, 1)
-                syn1Modify(inner) += 1
+                val b = random.nextInt(window)
+                for (i <- b - window to window - b if i != 0) {
+                  val c = pos + i
+                  if (c >= 0 && c < doc.length) {
+                    val lastWord = doc(c)
+                    val l1 = lastWord * vectorSize
+                    blas.sscal(vectorSize, 0f, neu1e, 1)
+                    for (j <- 0 until bcVocab.value(word).codeLen) {
+                      val inner = bcVocab.value(word).point(j)
+                      val l2 = inner * vectorSize
+                      val f = blas.sdot(vectorSize, syn2, l1, 1, syn1, l2, 1)
+                      val sig = if (f > MAX_EXP) 1 else if (f < -MAX_EXP) 0 else {
+                        val ind = ((f + MAX_EXP) * (EXP_TABLE_SIZE / MAX_EXP / 2.0)).toInt
+                        expTable.value(ind)
+                      }
+                      val g = ((1 - bcVocab.value(word).code(j) - sig) * wordAlpha).toFloat
+                      blas.saxpy(vectorSize, g, syn1, l2, 1, neu1e, 0, 1)
+                      blas.saxpy(vectorSize, g, syn2, l1, 1, syn1, l2, 1)
+                      syn1Modify(inner) += 1
+                    }
+                    blas.saxpy(vectorSize, 1.0f, neu1e, 0, 1, syn2, l1, 1)
+                    syn2Modify(lastWord) += 1
+                  }
+                }
+                blas.sscal(vectorSize, 0f, neu1e,1)
+                for (i <- 0 until bcVocab.value(word).codeLen) {
+                  val inner = bcVocab.value(word).point(i)
+                  val l2 = inner * vectorSize
+                  val f = blas.sdot(vectorSize, syn0, docIndex, 1, syn1, l2, 1)
+                  val sig = if (f > MAX_EXP) 1 else if (f < -MAX_EXP) 0 else {
+                    val ind = ((f + MAX_EXP) * (EXP_TABLE_SIZE / MAX_EXP / 2.0)).toInt
+                    expTable.value(ind)
+                  }
+                  val g = ((1 - bcVocab.value(word).code(i) - sig) * docAlpha).toFloat
+                  blas.saxpy(vectorSize, g, syn1, l2, 1, neu1e, 0, 1)
+                  blas.saxpy(vectorSize, g, syn0, docIndex, 1, syn1, l2, 1)
+                  syn1Modify(inner) += 1
+                }
+                blas.saxpy(vectorSize, 1.0f, neu1e, 0, 1, syn0, docIndex, 1)
               }
-              blas.saxpy(vectorSize, 1.0f, neu1e, 0, 1, syn0, docIndex, 1)
             }
             syn0Modify(id) += 1
-            (syn0, syn1)
+            (syn0, syn1, syn2, lwc, wc)
         }
 
         val syn0Local = model._1
         val syn1Local = model._2
+        val syn2Local = model._3
         // Only output modified vectors.
         Iterator.tabulate(docSize) { index =>
           if (syn0Modify(index) > 0) {
@@ -313,6 +379,13 @@ class Doc2Vec() extends Serializable with Logging {
           if (syn1Modify(index) > 0) {
             Some((index + docSize,
               (syn1Local.slice(index * vectorSize, (index + 1) * vectorSize), 1)))
+          } else {
+            None
+          }
+        }.flatten ++ Iterator.tabulate(vocabSize) { index =>
+          if (numIterations > 1 && syn2Modify(index) > 0) {
+            Some((index + docSize + vocabSize,
+              (syn2Local.slice(index * vectorSize, (index + 1) * vectorSize), 1)))
           } else {
             None
           }
@@ -332,24 +405,21 @@ class Doc2Vec() extends Serializable with Logging {
         val vec = word._2
         if (index < docSize) {
           Array.copy(vec, 0, syn0Global, index * vectorSize, vectorSize)
-        } else {
+        } else if (index < docSize + vocabSize){
           Array.copy(vec, 0, syn1Global, (index - docSize) * vectorSize, vectorSize)
+        } else {
+          Array.copy(vec, 0, syn2Global, (index - docSize - vocabSize) * vectorSize, vectorSize)
         }
       }
 
-
-      blas.saxpy(docSize * vectorSize, -1.0f, syn0Global, 1, delta, 1)
-      loss = blas.snrm2(docSize * vectorSize, delta, 1) / docSize
-      Array.copy(syn0Global, 0, delta, 0, docSize * vectorSize)
-
-      alpha = 0.8 * alpha
-      interation = interation + 1
       bcSyn0Global.destroy(false)
       bcSyn1Global.destroy(false)
+      bcSyn2Global.destroy(false)
     }
 
     documents.unpersist()
-    new Doc2VecModel(syn0Global, syn1Global, docSize, vectorSize, vocab, vocabHash, vocabSize, learningRate, numIterations)
+    new Doc2VecModel(syn0Global, syn1Global, docSize, vectorSize, vocab, vocabHash,
+      vocabSize, learningRate, numIterations, decay)
   }
 }
 
@@ -362,7 +432,8 @@ class Doc2VecModel private[spark](private[spark] val syn0: Array[Float],
                                   private[spark] val vocabHash: mutable.HashMap[String, Int],
                                   private[spark] val vocabSize: Int,
                                   private[spark] val learningRate: Double,
-                                  private[spark] val numIterations: Int) extends Serializable {
+                                  private[spark] val numIterations: Int,
+                                  private[spark] val decay: Double) extends Serializable {
 
   private val EXP_TABLE_SIZE = 1000
   private val MAX_EXP = 6
@@ -380,7 +451,6 @@ class Doc2VecModel private[spark](private[spark] val syn0: Array[Float],
     require(docId < docSize)
     Vectors.dense(syn0.slice(docId * vectorSize, (docId + 1) * vectorSize).map(_.toDouble))
   }
-
   def transform[S <: Iterable[String]](dataset: S): Vector = {
     val doc: Array[Int] = dataset.flatMap(vocabHash.get).toArray
 
@@ -388,12 +458,9 @@ class Doc2VecModel private[spark](private[spark] val syn0: Array[Float],
     val expTable = createExpTable()
     val vector = Array.fill[Float](vectorSize)((initRandom.nextFloat() - 0.5f) / vectorSize)
 
-    val delta = new Array[Float](vectorSize)
-    Array.copy(vector, 0, delta, 0, vectorSize)
-    var loss = Float.MaxValue
-    var interation = 0
     var alpha = learningRate
-    while(interation < numIterations && loss > 0.001) {
+
+    for(_ <- 0 until numIterations) {
       val neu1e = new Array[Float](vectorSize)
       for (pos <- doc.indices) {
         val word = doc(pos)
@@ -411,13 +478,9 @@ class Doc2VecModel private[spark](private[spark] val syn0: Array[Float],
         }
         blas.saxpy(vectorSize, 1.0f, neu1e, 0, 1, vector, 0, 1)
       }
-      blas.saxpy(vectorSize, -1.0f, vector, 1, delta, 1)
-      loss = blas.snrm2(vectorSize, delta, 1)
-      Array.copy(vector, 0, delta, 0, vectorSize)
-
-      alpha = 0.8 * alpha
-      interation = interation + 1
+      alpha = decay * alpha
     }
+
     Vectors.dense(vector.map(_.toDouble))
   }
 
@@ -429,7 +492,6 @@ class Doc2VecModel private[spark](private[spark] val syn0: Array[Float],
     }
     docVectors.toMap
   }
-
 }
 
 
